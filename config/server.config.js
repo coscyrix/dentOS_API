@@ -1,79 +1,80 @@
-//config/server.config.js
+import Express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import morgan from 'morgan';
+import paginate from 'express-paginate';
+import bodyParser from 'body-parser';
+import DbConfig from './db.config.js';
+import winston from './winston.js';
+import { resolve } from 'path';
+import https from 'https';
+import http from 'http';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-import Express from "express";
-import winston from "winston";
-import bodyParser from "body-parser";
-import DbConfig from "./db.config.js";
-import http from "http";
-import path from "path";
-import cors from "cors";
-import { fileURLToPath } from "url";
+// Ensure that you are using Node.js 14 or higher, which supports ESM.
 
 export default class ServerConfig {
   constructor({ port, middlewares, routers }) {
     this.app = Express();
-    this.app.set("env", process.env.NODE_ENV);
-    this.port = port;
+    this.app.set('env', process.env.NODE_ENV);
+    this.app.set('port', port);
     this.app.use(bodyParser.urlencoded({ extended: false }));
     this.app.use(bodyParser.json());
 
     const __filename = fileURLToPath(import.meta.url);
     const __dirname = path.dirname(__filename);
-    this.app.use("/", Express.static(path.join(__dirname, "public")));
 
-    this.app.use(cors());
-
-    middlewares?.forEach((mdlw) => {
-      this.registerMiddleware(mdlw);
-    });
-
-    this.app.get("/ping", (req, res) => {
-      res.send("pong");
-    });
-
-    routers?.forEach(({ baseUrl, router }) => {
-      this.registerRouter(baseUrl, router);
-    });
-
-    this.registerMiddleware(
-      // Catch 404 and forward to error handler
-      (req, res, next) => {
-        const err = new Error("Not Found");
-        err.statusCode = 404;
-        next(err);
-      }
+    this.app.use(
+      Express.json({
+        verify: function (req, res, buf) {
+          if (req.originalUrl.startsWith('/webhook')) {
+            req.rawBody = buf.toString();
+          }
+        },
+      }),
     );
 
-    this.registerErrorHandlingMiddleware();
+    this.app.use('/', Express.static('public'));
 
-    // Setup the winston console as an instance property
-    this.console = winston.createLogger({
-      level: "info",
-      transports: [
-        // Log errors to a file inside the logs folder
-        new winston.transports.File({
-          filename: "logs/error.log",
-          level: "error",
-          format: winston.format.combine(
-            winston.format.timestamp(),
-            winston.format.align(),
-            winston.format.printf(
-              (info) => `${info.timestamp} ${info.level}: ${info.message}`
-            )
-          ),
-        }),
-        // Log to console as well
-        new winston.transports.Console({
-          format: winston.format.combine(
-            winston.format.timestamp(),
-            winston.format.align(),
-            winston.format.printf(
-              (info) => `${info.timestamp} ${info.level}: ${info.message}`
-            )
-          ),
-        }),
-      ],
+    this.registerCORSMiddleware()
+      .registerHelmetMiddleware()
+      .registerMorganMiddleware()
+      .registerJSONMiddleware()
+      .registerExpressPaginateMiddleware();
+
+    if (middlewares) {
+      middlewares.forEach((mdlw) => {
+        this.registerMiddleware(mdlw);
+      });
+    }
+
+    this.app.get('/ping', (req, res, next) => {
+      res.send('pong');
     });
+
+    if (routers) {
+      routers.forEach(({ baseUrl, router }) => {
+        this.registerRouter(baseUrl, router);
+      });
+    }
+
+    this.registerMiddleware((req, res, next) => {
+      var err = new Error('Not Found');
+      err.statusCode = 404;
+      next(err);
+    });
+
+    this.registerErrorHandlingMiddleware();
+  }
+
+  get port() {
+    return this.app.get('port');
+  }
+
+  set port(number) {
+    this.app.set('port', number);
   }
 
   registerMiddleware(middleware) {
@@ -86,31 +87,84 @@ export default class ServerConfig {
     return this;
   }
 
-  registerErrorHandlingMiddleware() {
-    this.app.use((err, req, res, next) => {
-      const statusCode = err.statusCode || 500;
-      const message = err.message || "Internal Server Error";
-      res.status(statusCode).json({ statusCode, message });
+  registerJSONMiddleware() {
+    this.registerMiddleware(Express.json());
+    return this;
+  }
 
-      this.console.error(
-        `${statusCode} - ${message} - ${req.originalUrl} - ${req.method} - ${req.ip}`
-      );
-    });
+  registerCORSMiddleware() {
+    this.registerMiddleware(cors());
+    return this;
+  }
+
+  registerHelmetMiddleware() {
+    this.app.use(helmet());
+    return this;
+  }
+
+  registerMorganMiddleware() {
+    this.registerMiddleware(morgan('combined', { stream: winston.stream }));
+    return this;
+  }
+
+  registerExpressPaginateMiddleware() {
+    this.registerMiddleware(paginate.middleware(2, 100));
+    return this;
+  }
+
+  registerErrorHandlingMiddleware() {
+    this.app.get('env') === 'development'
+      ? this.registerMiddleware(
+          ({ statusCode = 502, message, stack }, req, res, next) => {
+            res.status(statusCode);
+            res.json({
+              statusCode,
+              message,
+            });
+
+            winston.error(
+              `DEV*******${statusCode || 500} - ${message} - ${
+                req.originalUrl
+              } - ${req.method} - ${req.ip}`,
+            );
+            console.log(stack);
+          },
+        )
+      : this.registerMiddleware(
+          ({ statusCode = 501, message, stack }, req, res, next) => {
+            winston.error(`${stack}`);
+            res.status(statusCode);
+            res.json({ statusCode, message });
+            winston.error(
+              `${statusCode || 500} - ${message} - ${req.originalUrl} - ${
+                req.method
+              } - ${req.ip}`,
+            );
+          },
+        );
+    return this;
   }
 
   async listen() {
     try {
-      const { default: knex } = await import("knex");
-      const db = knex(DbConfig.dbConn.development);
-      this.app.locals.knex = db;
+      const options = {
+        key: fs.readFileSync(process.env.SLS_DOT_COM_KEY),
+        cert: fs.readFileSync(process.env.SLS_DOT_COM_CERT),
+      };
 
-      // Create an HTTP server
-      const httpServer = http.createServer(this.app);
-      httpServer.listen(this.port, () => {
-        this.console.info(`🚀..Server running on port: ${this.port}`);
-      });
+      const server =
+        process.env.NODE_ENV === 'local_development'
+          ? http.createServer(options, this.app)
+          : https.createServer(options, this.app);
+
+      process.env.NODE_ENV === 'development'
+        ? https.createServer(options, this.app)
+        : https.createServer(options, this.app);
+
+      server.listen(this.port);
+      console.log(`HTTPS Listening on port: ${this.port} ...`);
     } catch (error) {
-      this.console.error(`Error: ${error.message}`);
+      console.error(`DB error: ${error.message}`);
     }
   }
 }
